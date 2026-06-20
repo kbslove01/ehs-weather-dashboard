@@ -4,6 +4,7 @@ import math
 import datetime
 import pandas as pd
 import os
+import urllib.parse
 
 # 1. 페이지 설정 (넓은 화면, 구획 테두리 없는 깔끔한 플랫 디자인 테마)
 st.set_page_config(layout="wide", page_title="EHS 온열질환 예측 대시보드")
@@ -15,7 +16,7 @@ st.markdown("<hr style='border:1px solid #0f172a;'>", unsafe_allow_html=True)
 # 한국어 요일 매핑용 리스트
 WEEKDAYS = ['월요일', '화요일', '수요일', '목요일', '금요일', '토요일', '일요일']
 
-# [보안 & 성능 보장] 기상청 API 과도한 호출 방지를 위한 1시간 캐싱 적용
+# 기상청 API 과도한 호출 방지를 위한 1시간 캐싱 적용
 @st.cache_data(ttl=3600)
 def fetch_kma_data():
     service_key = os.environ.get("KMA_SERVICE_KEY")
@@ -37,39 +38,49 @@ def fetch_kma_data():
     }, index=[f"{d.strftime('%m/%d')}({WEEKDAYS[d.weekday()][0]})" for d in dates])
 
     if not service_key:
+        print("⚠️ [Secrets 에러]: KMA_SERVICE_KEY 환경 변수가 로드되지 않았습니다.")
         return default_weather, default_forecast
 
+    # 💡 [해결책 1] 인증키 중복 인코딩 버그 방지
+    validated_key = urllib.parse.unquote(service_key)
+
+    # 💡 [해결책 2] 기상청 40분 데이터 생성 지연 안전 보정
+    adjusted_time = now - datetime.timedelta(minutes=40)
+    base_date = adjusted_time.strftime("%Y%m%d")
+    base_time = adjusted_time.strftime("%H00")
+    
     # A. 초단기실황 API 호출 (1행 실시간 데이터용)
     ncst_url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst"
-    base_date = now.strftime("%Y%m%d")
-    base_time = now.strftime("%H00")
+    ncst_res = None
     
     try:
-        ncst_res = requests.get(ncst_url, params={'serviceKey': service_key, 'pageNo': '1', 'numOfRows': '20', 'dataType': 'JSON', 'base_date': base_date, 'base_time': base_time, 'nx': '60', 'ny': '121'}, timeout=5).json()
+        response = requests.get(ncst_url, params={'serviceKey': validated_key, 'pageNo': '1', 'numOfRows': '20', 'dataType': 'JSON', 'base_date': base_date, 'base_time': base_time, 'nx': '60', 'ny': '121'}, timeout=5)
+        ncst_res = response.json()
         items = ncst_res['response']['body']['items']['item']
         for item in items:
             if item['category'] == 'T1H': default_weather["temp"] = float(item['obsrValue'])
             elif item['category'] == 'REH': default_weather["rh"] = float(item['obsrValue'])
-            elif item['category'] == 'RN1': default_weather["cur_rain"] = max(0.0, float(item['obsrValue']) if 'mm' not in str(item['obsrValue']) else 0.0)
-    except:
-        pass
+            elif item['category'] == 'RN1': default_weather["cur_rain"] = max(0.0, float(str(item['obsrValue']).replace('mm','').strip()) if '강수없음' not in str(item['obsrValue']) else 0.0)
+    except Exception as e:
+        print(f"🔴 [실시간 API 에러 발생]: {e}")
+        if ncst_res: 
+            print(f"💬 기상청 초단기실황 응답 내용: {ncst_res}")
 
     # B. 단기예보 API 호출 (2행 예보 및 3행 미래 꺾은선 그래프용)
-    # 단기예보 API 배포 주기(0200, 0500, 0800, 1100, 1400, 1700, 2000, 2300) 연산
     fcst_url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
-    hour = now.hour
-    if hour < 2: f_date, f_time = (now - datetime.timedelta(days=1)).strftime("%Y%m%d"), "2300"
+    hour = adjusted_time.hour
+    if hour < 2: f_date, f_time = (adjusted_time - datetime.timedelta(days=1)).strftime("%Y%m%d"), "2300"
     else:
         available_hours = [2, 5, 8, 11, 14, 17, 20, 23]
         closest_hour = max([h for h in available_hours if h <= hour])
-        f_date, f_time = now.strftime("%Y%m%d"), f"{closest_hour:02d}00"
+        f_date, f_time = adjusted_time.strftime("%Y%m%d"), f"{closest_hour:02d}00"
 
+    fcst_res = None
     try:
-        # 미래 데이터를 많이 받아오기 위해 행 수를 1000행으로 확장 호출
-        fcst_res = requests.get(fcst_url, params={'serviceKey': service_key, 'pageNo': '1', 'numOfRows': '1000', 'dataType': 'JSON', 'base_date': f_date, 'base_time': f_time, 'nx': '60', 'ny': '121'}, timeout=5).json()
+        response = requests.get(fcst_url, params={'serviceKey': validated_key, 'pageNo': '1', 'numOfRows': '1000', 'dataType': 'JSON', 'base_date': f_date, 'base_time': f_time, 'nx': '60', 'ny': '121'}, timeout=5)
+        fcst_res = response.json()
         f_items = fcst_res['response']['body']['items']['item']
         
-        # 데이터 파싱을 위한 임시 딕셔너리
         raw_data = []
         for item in f_items:
             raw_data.append({
@@ -80,9 +91,8 @@ def fetch_kma_data():
             })
         df_raw = pd.DataFrame(raw_data)
         
-        # 날짜별 데이터 가공 로직
         processed_forecast = {}
-        unique_dates = sorted(df_raw['date'].unique())[:5] # 최대 5일 분량 추출
+        unique_dates = sorted(df_raw['date'].unique())[:5]
         
         for idx, d_code in enumerate(unique_dates):
             d_obj = datetime.datetime.strptime(d_code, "%Y%m%d")
@@ -90,12 +100,10 @@ def fetch_kma_data():
             
             df_day = df_raw[df_raw['date'] == d_code]
             
-            # 기온 데이터 파싱 및 최고/평균 연산
             tmp_vals = df_day[df_day['category'] == 'TMP']['value'].astype(float).tolist()
             max_t = max(tmp_vals) if tmp_vals else default_forecast.iloc[idx, 0]
             avg_t = round(sum(tmp_vals)/len(tmp_vals), 1) if tmp_vals else default_forecast.iloc[idx, 1]
             
-            # 강수량/적설량 문자열 예외 처리 및 수치 파싱
             pcp_rows = df_day[df_day['category'] == 'PCP']['value'].tolist()
             rain_val = 0.0
             for p in pcp_rows:
@@ -117,12 +125,14 @@ def fetch_kma_data():
             
         final_df = pd.DataFrame(processed_forecast).T
         
-        # 5일치 칸이 부족할 경우 샘플 데이터로 보완 처리
         if len(final_df) < 5:
             final_df = pd.concat([final_df, default_forecast.iloc[len(final_df):]])
             
         return default_weather, final_df
-    except:
+    except Exception as e:
+        print(f"🔴 [미래예보 API 에러 발생]: {e}")
+        if fcst_res: 
+            print(f"💬 기상청 단기예보 응답 내용: {fcst_res}")
         return default_weather, default_forecast
 
 # 노동부 지침 체감온도 계산 함수
@@ -136,9 +146,9 @@ def calculate_apparent_temp(T, RH):
 w, df_forecast = fetch_kma_data()
 app_temp = calculate_apparent_temp(w["temp"], w["rh"])
 
-# 최고 기온 바인딩
+# 최고/최저 기온 데이터 바인딩
 w["high_temp"] = df_forecast.iloc[0, 0]
-w["low_temp"] = df_forecast.iloc[0, 1] - 5.0 # 최저 기온 근사 처리
+w["low_temp"] = df_forecast.iloc[0, 1] - 5.0 # 최저기온 유추 보정
 
 # 안전 보건 단계 설정
 if app_temp >= 38.0: level, color = "위험 단계", "#ef4444"
@@ -147,7 +157,7 @@ elif app_temp >= 33.0: level, color = "주의 단계", "#eab308"
 elif app_temp >= 31.0: level, color = "관심 단계", "#3b82f6"
 else: level, color = "정상 단계", "#10b981"
 
-# 📌 첫 번째 행: 구획(테두리) 없는 3열 배치 (날짜 및 요일 적용 완료)
+# 📌 첫 번째 행: 구획(테두리) 없는 3열 배치
 row1_col1, row1_col2, row1_col3 = st.columns(3)
 
 with row1_col1:
@@ -162,7 +172,7 @@ with row1_col2:
 
 with row1_col3:
     st.caption("🚨 단기 폭염 특보 리스크 예측")
-    tomorrow_max_app = df_forecast.iloc[1, 0] # 내일 최고 기온 기반 리스크 분석
+    tomorrow_max_app = df_forecast.iloc[1, 0]
     risk_msg = "실외 작업자 브레이크 타임 선제 조치 요망" if tomorrow_max_app >= 33.0 else "현장 온열 질환 예방 지침 준수 및 수분 섭취 권고"
     st.markdown(
         f"<div style='font-size:15px; line-height:1.7; color:#334155;'> "
@@ -174,7 +184,7 @@ with row1_col3:
 
 st.markdown("<br><hr style='border:0.5px solid #e2e8f0;'><br>", unsafe_allow_html=True)
 
-# 📌 두 번째 행: 구획 없는 4열 배치 (실시간 및 예보 데이터 자동 파싱 연동)
+# 📌 두 번째 행: 구획 없는 4열 배치
 row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
 
 with row2_col1:
@@ -202,9 +212,7 @@ with row2_col4:
 
 st.markdown("<br><hr style='border:0.5px solid #e2e8f0;'><br>", unsafe_allow_html=True)
 
-# 📌 세 번째 행: 기상청 단기예보 파싱 연동 꺾은선 그래프 영역
+# 📌 세 번째 행: 꺾은선 그래프 영역
 st.caption("📈 향후 5일간 기온 추이 분석 (기상청 단기예보 실시간 연동)")
-
-# 스트림릿 플랫 디자인에 가장 잘 맞는 꺾은선 선형 차트 출력
 chart_df = df_forecast[['최고기온 (🔴)', '평균기온 (🔵)']]
 st.line_chart(chart_df, height=300)
