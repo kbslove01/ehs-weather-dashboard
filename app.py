@@ -209,4 +209,3 @@ line_chart = alt.Chart(chart_melted).mark_line(interpolate='monotone', point=Tru
 ).interactive(False) # 💡 여기서 마우스 상호작용을 완전히 끕니다.
 
 st.altair_chart(line_chart, use_container_width=True)
-st.altair_chart(line_chart, use_container_width=True)
