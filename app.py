@@ -191,9 +191,10 @@ with row2_col4:
 st.markdown("<hr style='border:0.5px solid #e2e8f0; margin-top:10px; margin-bottom:10px;'>", unsafe_allow_html=True)
 
 # 📌 세 번째 행: 차트 영역 
+# 📌 기존의 꺾은선 그래프 부분을 아래 코드로 교체해 주세요.
 st.caption("📈 향후 5일간 기온 추이 분석 (기상청 단기예보 실시간 연동)")
 
-# 💡 [보완 핵심] 대화형 움직임(Zoom/Pan)을 비활성화하여 마우스 드래그 시 그래프가 틀어지는 버그를 차단합니다.
+# 💡 [보완 완료] interactive=False를 통해 마우스 조작을 완전히 차단하고 고정합니다.
 chart_df = df_forecast[['최고기온 (🔴)', '평균기온 (🔵)']].reset_index().rename(columns={'index': '날짜'})
 chart_melted = pd.melt(chart_df, id_vars=['날짜'], value_vars=['최고기온 (🔴)', '평균기온 (🔵)'], var_name='구분', value_name='기온 (°C)')
 
@@ -205,9 +206,7 @@ line_chart = alt.Chart(chart_melted).mark_line(interpolate='monotone', point=Tru
     tooltip=['날짜', '구분', '기온 (°C)']
 ).properties(
     height=220
-).configure_view(
-    # 드래그 축 이동 차단
-    bind=None
-)
+).interactive(False) # 💡 여기서 마우스 상호작용을 완전히 끕니다.
 
+st.altair_chart(line_chart, use_container_width=True)
 st.altair_chart(line_chart, use_container_width=True)
